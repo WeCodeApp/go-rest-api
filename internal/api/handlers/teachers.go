@@ -54,20 +54,86 @@ func TeachersHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func getTeachersHandler(w http.ResponseWriter, r *http.Request) {
+	db, err := sqlconnect.ConnectDb()
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	defer db.Close()
+
 	path := strings.TrimPrefix(r.URL.Path, "/teachers/")
 	idStr := strings.TrimSuffix(path, "/")
 
 	if idStr == "" {
-		firstName := r.URL.Query().Get("first_name")
-		lastName := r.URL.Query().Get("last_name")
+		pageStr := r.URL.Query().Get("page")
+		limitStr := r.URL.Query().Get("limit")
 
-		teacherList := make([]models.Teacher, 0, len(teachers))
+		if pageStr == "" {
+			pageStr = "1"
+		}
+		if limitStr == "" {
+			limitStr = "10"
+		}
 
-		for _, value := range teachers {
-			if (firstName == "" || value.FirstName == firstName) && (lastName == "" || value.LastName == lastName) {
-				teacherList = append(teacherList, value)
+		page, _ := strconv.Atoi(pageStr)
+		limit, _ := strconv.Atoi(limitStr)
+
+		maxLimit := 100
+		if limit > maxLimit {
+			http.Error(w, "Limit cannot be greater than 100", http.StatusBadRequest)
+			return
+		}
+
+		query := "SELECT id, first_name, last_name, subject, class, email FROM teachers WHERE 1=1"
+		queryTotal := "SELECT COUNT(id) FROM teachers WHERE 1=1 "
+		var args []interface{}
+		var argsTotal []interface{}
+
+		params := map[string]string{
+			"first_name": "first_name",
+			"last_name":  "last_name",
+			"email":      "email",
+			"class":      "class",
+			"subject":    "subject",
+		}
+
+		for param, dbField := range params {
+			if value := r.URL.Query().Get(param); value != "" {
+				query += " AND " + dbField + " = ? "
+				queryTotal += " AND " + dbField + " = ? "
+				args = append(args, value)
+				argsTotal = append(argsTotal, value)
 			}
+		}
 
+		offset := (page - 1) * limit
+		query += " LIMIT ? OFFSET ?"
+		args = append(args, limit, offset)
+
+		teacherList := make([]models.Teacher, 0)
+
+		rows, err := db.Query(query, args...)
+		if err != nil {
+			http.Error(w, "Error querying teachers", http.StatusInternalServerError)
+			return
+		}
+		defer rows.Close()
+
+		for rows.Next() {
+			var teacher models.Teacher
+			err = rows.Scan(&teacher.ID, &teacher.FirstName, &teacher.LastName, &teacher.Subject, &teacher.Class, &teacher.Email)
+			if err != nil {
+				http.Error(w, "Error scanning teachers", http.StatusInternalServerError)
+				return
+			}
+			teacherList = append(teacherList, teacher)
+		}
+
+		var total int
+		err = db.QueryRow(queryTotal, argsTotal...).Scan(&total)
+		if err != nil {
+			http.Error(w, "Error scanning total teachers", http.StatusInternalServerError)
+			return
 		}
 
 		response := struct {
@@ -76,7 +142,7 @@ func getTeachersHandler(w http.ResponseWriter, r *http.Request) {
 			Data   []models.Teacher `json:"data"`
 		}{
 			Status: "success",
-			Count:  len(teacherList),
+			Count:  total,
 			Data:   teacherList,
 		}
 
