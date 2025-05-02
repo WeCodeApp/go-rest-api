@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"github.com/google/uuid"
@@ -15,6 +16,22 @@ var (
 	teachers = make(map[int]models.Teacher)
 	nextID   = 1
 )
+
+func isValidSortOrder(order string) bool {
+	return order == "asc" || order == "desc"
+}
+
+func isValidSortField(field string) bool {
+	validFields := map[string]bool{
+		"first_name": true,
+		"last_name":  true,
+		"email":      true,
+		"class":      true,
+		"subject":    true,
+	}
+
+	return validFields[field]
+}
 
 func init() {
 	teachers[nextID] = models.Teacher{
@@ -84,56 +101,45 @@ func getTeachersHandler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		query := "SELECT id, first_name, last_name, subject, class, email FROM teachers WHERE 1=1"
-		queryTotal := "SELECT COUNT(id) FROM teachers WHERE 1=1 "
+		query := "SELECT id, first_name, last_name, email, class, subject FROM teachers WHERE 1=1"
+		queryCount := "SELECT COUNT(id) FROM teachers WHERE 1=1"
 		var args []interface{}
-		var argsTotal []interface{}
+		var argsCount []interface{}
 
-		params := map[string]string{
-			"first_name": "first_name",
-			"last_name":  "last_name",
-			"email":      "email",
-			"class":      "class",
-			"subject":    "subject",
-		}
+		query, args, queryCount, argsCount = addFilters(r, query, queryCount, args, argsCount)
 
-		for param, dbField := range params {
-			if value := r.URL.Query().Get(param); value != "" {
-				query += " AND " + dbField + " = ? "
-				queryTotal += " AND " + dbField + " = ? "
-				args = append(args, value)
-				argsTotal = append(argsTotal, value)
-			}
-		}
+		query = addSorting(r, query)
 
+		// Add pagination
 		offset := (page - 1) * limit
 		query += " LIMIT ? OFFSET ?"
 		args = append(args, limit, offset)
 
-		teacherList := make([]models.Teacher, 0)
-
 		rows, err := db.Query(query, args...)
 		if err != nil {
-			http.Error(w, "Error querying teachers", http.StatusInternalServerError)
+			fmt.Println(err)
+			http.Error(w, "Database query error", http.StatusInternalServerError)
 			return
 		}
 		defer rows.Close()
 
+		teacherList := make([]models.Teacher, 0)
 		for rows.Next() {
 			var teacher models.Teacher
-			err = rows.Scan(&teacher.ID, &teacher.FirstName, &teacher.LastName, &teacher.Subject, &teacher.Class, &teacher.Email)
+			err := rows.Scan(&teacher.ID, &teacher.FirstName, &teacher.LastName, &teacher.Email, &teacher.Class, &teacher.Subject)
 			if err != nil {
-				http.Error(w, "Error scanning teachers", http.StatusInternalServerError)
+				http.Error(w, "Database scan error", http.StatusInternalServerError)
 				return
 			}
 			teacherList = append(teacherList, teacher)
 		}
 
-		var total int
-		err = db.QueryRow(queryTotal, argsTotal...).Scan(&total)
+		var totalTeachers int
+
+		err = db.QueryRow(queryCount, argsCount...).Scan(&totalTeachers)
 		if err != nil {
-			http.Error(w, "Error scanning total teachers", http.StatusInternalServerError)
-			return
+			fmt.Println(err)
+			totalTeachers = 0
 		}
 
 		response := struct {
@@ -142,7 +148,7 @@ func getTeachersHandler(w http.ResponseWriter, r *http.Request) {
 			Data   []models.Teacher `json:"data"`
 		}{
 			Status: "success",
-			Count:  total,
+			Count:  totalTeachers,
 			Data:   teacherList,
 		}
 
@@ -150,18 +156,69 @@ func getTeachersHandler(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(response)
 	}
 
-	id, err := strconv.Atoi(idStr)
-	if err != nil {
+	var teacher models.Teacher
+
+	query := "SELECT id, first_name, last_name, email, class, subject FROM teachers WHERE id = ?"
+	row := db.QueryRow(query, idStr)
+
+	err = row.Scan(&teacher.ID, &teacher.FirstName, &teacher.LastName, &teacher.Email, &teacher.Class, &teacher.Subject)
+	if err == sql.ErrNoRows {
+		http.Error(w, "Teacher not found", http.StatusNotFound)
+		return
+	} else if err != nil {
 		fmt.Println(err)
+		http.Error(w, "Database query error", http.StatusInternalServerError)
 		return
 	}
 
-	teacher, exists := teachers[id]
-	if !exists {
-		http.Error(w, "Teacher not found", http.StatusNotFound)
-		return
-	}
+	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(teacher)
+}
+
+func addSorting(r *http.Request, query string) string {
+	// teachers/?sort_by=name:asc&sort_by=class:desc
+	sortParams := r.URL.Query()["sort_by"] // slice of strings
+	if len(sortParams) > 0 {
+		query += " ORDER BY"
+		for i, param := range sortParams {
+			parts := strings.Split(param, ":")
+			if len(parts) != 2 {
+				continue
+			}
+			field, order := parts[0], parts[1]
+			if !isValidSortField(field) || !isValidSortOrder(order) {
+				continue
+			}
+			if i > 0 {
+				query += ","
+			}
+			query += " " + field + " " + order
+		}
+	}
+
+	return query
+}
+
+func addFilters(r *http.Request, query, queryCount string, args, argsCount []interface{}) (string, []interface{}, string, []interface{}) {
+	params := map[string]string{
+		"first_name": "first_name",
+		"last_name":  "last_name",
+		"email":      "email",
+		"class":      "class",
+		"subject":    "subject",
+	}
+
+	for param, dbField := range params {
+		value := r.URL.Query().Get(param)
+		if value != "" {
+			query += " AND " + dbField + " = ?"
+			queryCount += " AND " + dbField + " = ?"
+			args = append(args, value)
+			argsCount = append(argsCount, value)
+		}
+	}
+
+	return query, args, queryCount, argsCount
 }
 
 func addTeachersHandler(w http.ResponseWriter, r *http.Request) {
